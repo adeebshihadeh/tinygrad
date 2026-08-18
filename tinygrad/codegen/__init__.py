@@ -1,7 +1,7 @@
 from dataclasses import replace, dataclass
-import itertools, functools
+import itertools, functools, multiprocessing
 from tinygrad.helpers import DISABLE_FAST_IDIV, TRANSCENDENTAL, SPEC, DEBUG, VIZ, IMAGE, NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC
-from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TracingKey, Context, panic
+from tinygrad.helpers import ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT, TracingKey, Context, ContextVar, panic
 from tinygrad.uop.ops import PatternMatcher, graph_rewrite, UOp, Ops, UPat, rewrite_group, KernelInfo, ProgramInfo, GroupOp, AxisType
 from tinygrad.uop.weak import pm_lower_index_dtype, pm_commit_weak, pm_cast_weak
 from tinygrad.uop.render import pyrender
@@ -481,8 +481,27 @@ def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   return prg
 
 to_program_cache: dict[tuple, UOp] = {}
-def to_program(ast:UOp, renderer:Renderer) -> UOp:
+def to_program_key(ast:UOp, renderer:Renderer) -> tuple:
   config = (NOOPT, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32, DEFAULT_FLOAT, DEFAULT_INT)
-  key = (ast.key, type(renderer), renderer.target, *[x.value for x in config])
+  return (ast.key, type(renderer), renderer.target, *[x.value for x in config])
+
+def to_program(ast:UOp, renderer:Renderer) -> UOp:
+  key = to_program_key(ast, renderer)
   if (prg:=to_program_cache.get(key)) is None: to_program_cache[key] = prg = do_to_program(ast, renderer)
   return prg
+
+def _to_program_worker(args) -> UOp:
+  ast, renderer, context = args
+  with Context(**{k:v for k,v in context.items() if k in ContextVar._cache}): return to_program(ast, renderer)
+
+def precompile_programs(items:list[tuple[UOp, Renderer]], workers:int) -> None:
+  if workers <= 1: return
+  jobs = {}
+  for ast,renderer in items:
+    key = to_program_key(ast, renderer)
+    if key not in to_program_cache: jobs.setdefault(key, (ast, renderer))
+  if len(jobs) < 2: return
+  context = {k:v.value for k,v in ContextVar._cache.items()}
+  with multiprocessing.get_context("spawn").Pool(min(workers, len(jobs))) as pool:
+    compiled = pool.map(_to_program_worker, ((*item, context) for item in jobs.values()), chunksize=1)
+  to_program_cache.update(zip(jobs, compiled))

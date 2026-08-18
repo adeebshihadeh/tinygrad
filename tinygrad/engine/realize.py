@@ -7,7 +7,7 @@ from tinygrad.helpers import BEAM, size_to_str, time_to_str, VALIDATE_WITH_CPU, 
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, UPat, AxisType, sym_infer, graph_rewrite
 from tinygrad.device import Device, Buffer, MultiBuffer, ProfileGraphEntry
 from tinygrad.renderer import Estimates
-from tinygrad.codegen import to_program
+from tinygrad.codegen import to_program, precompile_programs
 from tinygrad.codegen.opt.postrange import args_from_ast
 
 # **************** Helpers ****************
@@ -266,7 +266,11 @@ if getenv("HCQ2"): from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_li
 
 def compile_linear(linear:UOp, beam:int|None=None, validate=False, input_uops:list[UOp]|None=None, profile:bool|None=None) -> UOp:
   if validate: linear = graph_rewrite(linear, pm_validate, name="validate", walk=True)
-  if (beam_val:=BEAM.value if beam is None else beam) >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
+  beam_val, workers = BEAM.value if beam is None else beam, getenv("PARALLEL_COMPILE", 0)
+  assert workers <= 1 or beam_val < 1, "PARALLEL_COMPILE and BEAM cannot be enabled together"
+  if beam_val >= 1: linear = graph_rewrite(linear, pm_beam, ctx=beam_val, walk=True)
+  if workers > 1: precompile_programs([(call.src[0], Device[call.device if isinstance(call.device, str) else call.device[0]].renderer)
+                                       for call in linear.src if call.op is Ops.CALL and call.src[0].op in (Ops.SINK, Ops.PROGRAM)], workers)
   linear = graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
   if getenv("HCQ2"): linear = hcq_compile(linear, input_uops, bool(PROFILE or DEBUG >= 2) if profile is None else profile)
   return graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
